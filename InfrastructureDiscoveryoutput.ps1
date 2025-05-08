@@ -42,6 +42,10 @@
 .NOTES
     Author: Your Name/Org (Modified with community function)
     Date: 2025-05-08
+    Version: 2.10.12 (Service Principal Auth, Fixed TypeNotFound)
+             - Removed [Microsoft.ActiveDirectory.Management.ADError] type check in SID retrieval to prevent TypeNotFound crash.
+             - Enhanced error handling in SID retrieval to log exception type and inner exception.
+             - Updated Check-RequiredModules to verify ActiveDirectory module functionality.
     Version: 2.10.11 (Service Principal Auth)
              - Updated to use service principal authentication for Microsoft Graph to match discovery script
              - Added ClientId, ClientSecret, TenantId parameters
@@ -199,11 +203,21 @@ function Check-RequiredModules {
             }
         } else {
             Write-Verbose "Module $($moduleName) found (any version acceptable)."
+            if ($moduleName -eq "ActiveDirectory") {
+                try {
+                    Import-Module ActiveDirectory -ErrorAction Stop
+                    Get-ADDomain -ErrorAction Stop | Out-Null
+                    Write-Verbose "ActiveDirectory module is functional."
+                } catch {
+                    Write-Log "ActiveDirectory module loaded but not functional: $($_.Exception.Message)" -Level WARN
+                    $missingModules += $moduleInfo
+                }
+            }
         }
     }
 
     if ($missingModules.Count -gt 0) {
-        Write-Log "Missing required modules:" -Level "WARN"
+        Write-Log "Missing or non-functional required modules:" -Level WARN
         $nonInstallableMissing = @()
 
         foreach ($missing in $missingModules) {
@@ -218,11 +232,11 @@ function Check-RequiredModules {
         }
 
         if ($nonInstallableMissing.Count -gt 0) {
-            Write-Log "Cannot proceed without missing modules. Please ensure RSAT features or required modules are installed." -Level ERROR
+            Write-Log "Cannot proceed without missing or non-functional modules. Please ensure RSAT features or required modules are installed." -Level ERROR
             exit 1
         }
     } else {
-        Write-Log "All required modules are available."
+        Write-Log "All required modules are available and functional."
     }
 }
 
@@ -299,11 +313,11 @@ function Import-InputCsv {
         try {
             return Import-Csv -Path $filePath -Encoding UTF8 -ErrorAction Stop
         } catch {
-            Write-Log "Error loading CSV '$($filePath)': $($_.Exception.Message)" -Level "ERROR"
+            Write-Log "Error loading CSV '$($filePath)': $($_.Exception.Message)" -Level ERROR
             return $null
         }
     } else {
-        Write-Log "Input file not found: '$($filePath)'" -Level "WARN"
+        Write-Log "Input file not found: '$($filePath)'" -Level WARN
         return $null
     }
 }
@@ -318,19 +332,24 @@ function Append-BatchToCsvs {
         $fileNameBase = $item.Name
         $dataList = $item.Value
         $filePath = Join-Path $OutputCsvPath "$($fileNameBase).csv"
+        Write-Verbose "Processing output for '$fileNameBase' with $($dataList.Count) records"
         if ($dataList -and $dataList.Count -gt 0) {
             try {
                 $fileExists = Test-Path $filePath -PathType Leaf
                 if (-not $fileExists) {
-                    Write-Verbose "Creating and writing batch to $($filePath) (with headers)"
+                    Write-Log "Creating new CSV file: $filePath" -Level INFO
                     $dataList | Export-Csv -Path $filePath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+                    Write-Log "Successfully created and wrote $($dataList.Count) records to '$filePath'" -Level INFO
                 } else {
-                    Write-Verbose "Appending batch to $($filePath) (without headers)"
+                    Write-Log "Appending $($dataList.Count) records to existing CSV: $filePath" -Level INFO
                     $dataList | Export-Csv -Path $filePath -NoTypeInformation -Encoding UTF8 -Append -ErrorAction Stop
+                    Write-Log "Successfully appended records to '$filePath'" -Level INFO
                 }
             } catch {
-                Write-Log "Error writing batch to CSV '$($filePath)': $($_.Exception.Message)" -Level ERROR
+                Write-Log "Error writing to CSV '$filePath': $($_.Exception.Message)" -Level ERROR
             }
+        } else {
+            Write-Log "No data to write for '$fileNameBase'. Skipping CSV output." -Level INFO
         }
     }
     Write-Log "Finished appending batch data." -Level INFO
@@ -436,10 +455,11 @@ function Get-AppliedGPOsForUser {
         [Parameter(Mandatory = $true)] [hashtable]$GpoPermissionsCache,
         [Parameter(Mandatory = $true)] [hashtable]$GpoLinkCache
     )
+    Write-Verbose "Processing GPOs for user '$($User.SamAccountName)' with SID '$($User.SID)'"
     $appliedGpos = [System.Collections.Generic.List[PSCustomObject]]::new()
     $userSid = $User.SID
     if (-not $userSid -or -not ($userSid -is [string]) -or $userSid.Length -lt 5) {
-        Write-Log "Cannot determine GPO application for $($User.$UserIdentifierProperty) without a valid user SID string." -Level WARN
+        Write-Log "Cannot determine GPO application for $($User.$UserIdentifierProperty) (SAM: $($User.SamAccountName)) without a valid user SID string." -Level WARN
         return $appliedGpos
     }
     $userGroupsSids = if ($UserGroupMembershipSids.ContainsKey($User.SamAccountName)) { $UserGroupMembershipSids[$User.SamAccountName] } else { @() }
@@ -448,7 +468,7 @@ function Get-AppliedGPOsForUser {
     $currentOu = $ouPath
     $domainDN = if ($User.DistinguishedName -match 'DC=.*') { ($User.DistinguishedName -split '(DC=.*)', 2)[1] } else { $null }
     if (-not $domainDN) {
-        Write-Log "Could not determine domain DN from user DN: $($User.DistinguishedName)" -Level WARN
+        Write-Log "Could not determine domain DN from user DN for $($User.$UserIdentifierProperty) (DN: $($User.DistinguishedName))" -Level WARN
         return $appliedGpos
     }
     while ($currentOu -ne $domainDN -and $currentOu -match '(OU=|CN=)') {
@@ -464,107 +484,127 @@ function Get-AppliedGPOsForUser {
         try {
             if (-not $gpoLinkCache.ContainsKey($ouDN)) {
                 Write-Verbose "Querying GPO links for OU/Domain: $($ouDN)"
-                if ([string]::IsNullOrWhiteSpace($DomainController)) { throw "Domain Controller name is missing" }
-                $gpoLinkCache[$ouDN] = Get-Gplink -path $ouDN -server $DomainController
+                if ([string]::IsNullOrWhiteSpace($script:SelectedDomainController)) { 
+                    Write-Log "Domain Controller missing for GPO link query on '$ouDN' for user $($User.$UserIdentifierProperty)" -Level WARN
+                    continue
+                }
+                $gpoLinkCache[$ouDN] = Get-Gplink -path $ouDN -server $script:SelectedDomainController
             }
             $links = $gpoLinkCache[$ouDN]
-            if ($links -ne $null -and $links.Count -gt 0) {
-                foreach ($link in $links) {
-                    $gpoId = $link.GPOID
-                    if (-not $gpoId -or $gpoId.Length -ne 36) {
-                        Write-Log "Skipping link on '$($ouDN)' due to invalid GPOID: '$($gpoId)'" -Level WARN
+            if ($links -eq $null -or $links.Count -eq 0) {
+                Write-Verbose "No GPO links found for OU/Domain: $($ouDN)"
+                continue
+            }
+            foreach ($link in $links) {
+                $gpoId = $link.GPOID
+                if (-not $gpoId -or $gpoId.Length -ne 36) {
+                    Write-Log "Skipping link on '$ouDN' due to invalid GPOID: '$($gpoId)' for user $($User.$UserIdentifierProperty)" -Level WARN
+                    continue
+                }
+                $gpoName = $link.DisplayName
+                $isEnforced = ($link.Enforced -eq 'Yes')
+                $isEnabled = ($link.Enabled -eq 'Yes')
+                if (-not $isEnabled) {
+                    Write-Verbose "Skipping disabled GPO link: $($gpoName) on $ouDN"
+                    continue
+                }
+                if ($processedGpoIds.Contains($gpoId) -and !$isEnforced) {
+                    Write-Verbose "Skipping GPO '$($gpoName)' linked at '$($ouDN)' as it was already processed."
+                    continue
+                }
+                if (-not $GpoPermissionsCache.ContainsKey($gpoId)) {
+                    Write-Verbose "Querying permissions for GPO: $($gpoName) ($($gpoId))"
+                    if ([string]::IsNullOrWhiteSpace($script:SelectedDomainController)) { 
+                        Write-Log "Domain Controller missing for GPO permission query on '$gpoName' ($gpoId) for user $($User.$UserIdentifierProperty)" -Level WARN
                         continue
                     }
-                    $gpoName = $link.DisplayName
-                    $isEnforced = ($link.Enforced -eq 'Yes')
-                    $isEnabled = ($link.Enabled -eq 'Yes')
-                    if (-not $isEnabled) {
-                        Write-Verbose "Skipping disabled GPO link: $($gpoName) on $ouDN"
-                        continue
-                    }
-                    if ($processedGpoIds.Contains($gpoId) -and !$isEnforced) {
-                        Write-Verbose "Skipping GPO '$($gpoName)' linked at '$($ouDN)' as it was already processed."
-                        continue
-                    }
-                    if (-not $GpoPermissionsCache.ContainsKey($gpoId)) {
-                        Write-Verbose "Querying permissions for GPO: $($gpoName) ($($gpoId))"
-                        if ([string]::IsNullOrWhiteSpace($DomainController)) { throw "Domain Controller name is missing" }
-                        if (Get-Command Get-GPPermission -ErrorAction SilentlyContinue) {
-                            $GpoPermissionsCache[$gpoId] = Get-GPPermission -Guid $gpoId -All -Server $DomainController -ErrorAction SilentlyContinue
-                        } else {
-                            Write-Log "Get-GPPermission command not found for GPO '$gpoName' ($gpoId)." -Level WARN
+                    if (Get-Command Get-GPPermission -ErrorAction SilentlyContinue) {
+                        try {
+                            $GpoPermissionsCache[$gpoId] = Get-GPPermission -Guid $gpoId -All -Server $script:SelectedDomainController -ErrorAction Stop
+                        } catch {
+                            Write-Log "Failed to retrieve permissions for GPO '$gpoName' ($gpoId) for user $($User.$UserIdentifierProperty): $($_.Exception.Message)" -Level WARN
                             $GpoPermissionsCache[$gpoId] = $null
                         }
+                    } else {
+                        Write-Log "Get-GPPermission command not found for GPO '$gpoName' ($gpoId) for user $($User.$UserIdentifierProperty)." -Level WARN
+                        $GpoPermissionsCache[$gpoId] = $null
                     }
-                    $permissions = $GpoPermissionsCache[$gpoId]
-                    if ($permissions) {
-                        $denyACEs = $permissions | Where-Object { $_.Type -eq 'Deny' -and $_.Permission -eq 'GpoApply' }
-                        $isDenied = $false
-                        foreach ($ace in $denyACEs) {
-                            if ($ace.Trustee.Sid.Value -eq $userSid -or ($userGroupsSids -contains $ace.Trustee.Sid.Value)) {
-                                $isDenied = $true
-                                break
-                            }
+                }
+                $permissions = $GpoPermissionsCache[$gpoId]
+                if ($permissions) {
+                    $denyACEs = $permissions | Where-Object { $_.Type -eq 'Deny' -and $_.Permission -eq 'GpoApply' }
+                    $isDenied = $false
+                    foreach ($ace in $denyACEs) {
+                        if ($ace.Trustee.Sid.Value -eq $userSid -or ($userGroupsSids -contains $ace.Trustee.Sid.Value)) {
+                            $isDenied = $true
+                            break
                         }
-                        if (-not $isDenied) {
-                            $allowACEs = $permissions | Where-Object { $_.Type -eq 'Allow' -and $_.Permission -eq 'GpoApply' }
-                            $explicitAllow = $false
-                            $groupAllows = $false
-                            foreach ($ace in $allowACEs) {
-                                if ($ace.Trustee.Sid.Value -eq $userSid) { $explicitAllow = $true }
-                                if ($userGroupsSids -contains $ace.Trustee.Sid.Value) { $groupAllows = $true }
-                            }
-                            $authUsersApply = $allowACEs | Where-Object { $_.Trustee.Sid.Value -eq "S-1-5-11" }
-                            if ($authUsersApply -or $explicitAllow -or $groupAllows) {
-                                $appliedGpos.Add([PSCustomObject]@{
-                                    UserIdentifier     = $User.$UserIdentifierProperty
-                                    GpoName            = $gpoName
-                                    GpoId              = $gpoId
-                                    Link_Target_DN     = $ouDN
-                                    Link_Order         = $link.Order
-                                    IsSecurityFiltered = $true
-                                    IsEnforced         = $isEnforced
-                                })
-                                if (!$isEnforced) { $processedGpoIds.Add($gpoId) | Out-Null }
-                            } else {
-                                Write-Verbose "GPO '$($gpoName)' skipped for user '$($User.$UserIdentifierProperty)' due to security filtering."
-                                if (!$isEnforced) { $processedGpoIds.Add($gpoId) | Out-Null }
-                            }
-                        } elseif ($isDenied) {
-                            Write-Verbose "GPO '$($gpoName)' skipped for user '$($User.$UserIdentifierProperty)' due to explicit Deny ACE."
+                    }
+                    if (-not $isDenied) {
+                        $allowACEs = $permissions | Where-Object { $_.Type -eq 'Allow' -and $_.Permission -eq 'GpoApply' }
+                        $explicitAllow = $false
+                        $groupAllows = $false
+                        foreach ($ace in $allowACEs) {
+                            if ($ace.Trustee.Sid.Value -eq $userSid) { $explicitAllow = $true }
+                            if ($userGroupsSids -contains $ace.Trustee.Sid.Value) { $groupAllows = $true }
+                        }
+                        $authUsersApply = $allowACEs | Where-Object { $_.Trustee.Sid.Value -eq "S-1-5-11" }
+                        if ($authUsersApply -or $explicitAllow -or $groupAllows) {
+                            $appliedGpos.Add([PSCustomObject]@{
+                                UserIdentifier     = $User.$UserIdentifierProperty
+                                GpoName            = $gpoName
+                                GpoId              = $gpoId
+                                Link_Target_DN     = $ouDN
+                                Link_Order         = $link.Order
+                                IsSecurityFiltered = $true
+                                IsEnforced         = $isEnforced
+                            })
+                            Write-Verbose "Applied GPO '$gpoName' ($gpoId) to user $($User.$UserIdentifierProperty)"
+                            if (!$isEnforced) { $processedGpoIds.Add($gpoId) | Out-Null }
+                        } else {
+                            Write-Verbose "GPO '$gpoName' skipped for user '$($User.$UserIdentifierProperty)' due to security filtering."
                             if (!$isEnforced) { $processedGpoIds.Add($gpoId) | Out-Null }
                         }
-                    } else {
-                        Write-Log "Could not retrieve permissions for GPO '$($gpoName)' ($($gpoId)). Assuming applies." -Level WARN
-                        $appliedGpos.Add([PSCustomObject]@{
-                            UserIdentifier     = $User.$UserIdentifierProperty
-                            GpoName            = $gpoName
-                            GpoId              = $gpoId
-                            Link_Target_DN     = $ouDN
-                            Link_Order         = $link.Order
-                            IsSecurityFiltered = $false
-                            IsEnforced         = $isEnforced
-                        })
+                    } elseif ($isDenied) {
+                        Write-Verbose "GPO '$gpoName' skipped for user '$($User.$UserIdentifierProperty)' due to explicit Deny ACE."
                         if (!$isEnforced) { $processedGpoIds.Add($gpoId) | Out-Null }
                     }
+                } else {
+                    Write-Log "Could not retrieve permissions for GPO '$gpoName' ($gpoId) for user $($User.$UserIdentifierProperty). Assuming applies." -Level WARN
+                    $appliedGpos.Add([PSCustomObject]@{
+                        UserIdentifier     = $User.$UserIdentifierProperty
+                        GpoName            = $gpoName
+                        GpoId              = $gpoId
+                        Link_Target_DN     = $ouDN
+                        Link_Order         = $link.Order
+                        IsSecurityFiltered = $false
+                        IsEnforced         = $isEnforced
+                    })
+                    Write-Verbose "Applied GPO '$gpoName' ($gpoId) to user $($User.$UserIdentifierProperty) (no permissions data)"
+                    if (!$isEnforced) { $processedGpoIds.Add($gpoId) | Out-Null }
                 }
             }
         } catch {
-            Write-Log "Error processing GPO links for target '$($ouDN)': $($_.Exception.Message)" -Level WARN
+            Write-Log "Error processing GPO links for target '$ouDN' for user $($User.$UserIdentifierProperty): $($_.Exception.Message)" -Level WARN
+            continue
         }
         if ($ouDN -like 'OU=*') {
             try {
-                if ([string]::IsNullOrWhiteSpace($DomainController)) { throw "Domain Controller name is missing" }
-                $ouObject = Get-ADOrganizationalUnit -Identity $ouDN -Properties Options -Server $DomainController -ErrorAction SilentlyContinue
+                if ([string]::IsNullOrWhiteSpace($script:SelectedDomainController)) { 
+                    Write-Log "Domain Controller missing for OU inheritance check on '$ouDN' for user $($User.$UserIdentifierProperty)" -Level WARN
+                    continue
+                }
+                $ouObject = Get-ADOrganizationalUnit -Identity $ouDN -Properties Options -Server $script:SelectedDomainController -ErrorAction SilentlyContinue
                 if ($ouObject -and ($ouObject.Options -band 1)) {
-                    Write-Verbose "Inheritance blocked at OU: $($ouDN)."
+                    Write-Verbose "Inheritance blocked at OU: $($ouDN) for user $($User.$UserIdentifierProperty)"
                     break
                 }
             } catch {
-                Write-Log "Could not check inheritance blocking for OU '$($ouDN)': $($_.Exception.Message)" -Level WARN
+                Write-Log "Could not check inheritance blocking for OU '$ouDN' for user $($User.$UserIdentifierProperty): $($_.Exception.Message)" -Level WARN
             }
         }
     }
+    Write-Verbose "Completed GPO processing for user '$($User.SamAccountName)'. Applied $($appliedGpos.Count) GPOs."
     return $appliedGpos
 }
 
@@ -594,7 +634,7 @@ function Get-GraphTransitiveGroupMembers {
 
 #region Main Aggregation Logic
 Write-Log "=========================================================="
-Write-Log " Starting User-Centric Data Aggregation (v2.10.11 - Service Principal Auth) "
+Write-Log " Starting User-Centric Data Aggregation (v2.10.12 - Service Principal Auth, Fixed TypeNotFound) "
 Write-Log " Input Path: $($InputCsvPath)"
 Write-Log " Output Path: $($OutputCsvPath)"
 Write-Log " User Identifier: $($UserIdentifierProperty)"
@@ -705,70 +745,154 @@ foreach ($userSAM in ($userGroupMembershipsAD.Keys | Where-Object { $_ })) {
         $userGroupSidsAD[$userSAM] = $sids
     }
 }
-
-
-# Replace the SID retrieval section in the preprocessing phase
 Write-Log "Ensuring User SIDs are available..." -Level INFO
 $userSidCache = @{}
-# Validate Domain Controller connectivity
-try {
-    Write-Verbose "Testing connectivity to Domain Controller: $DomainController"
-    $dcInfo = Get-ADDomainController -Identity $DomainController -ErrorAction Stop
-    Write-Log "Domain Controller '$DomainController' is reachable." -Level INFO
-} catch {
-    Write-Log "Failed to connect to Domain Controller '$DomainController': $($_.Exception.Message)" -Level ERROR
-    Write-Log "Cannot proceed with SID retrieval. Please verify the DomainController parameter." -Level ERROR
-    exit 1
+$script:SelectedDomainController = $null
+$maxRetries = 3
+$retryDelaySeconds = 2
+$sidRetrievalCount = 0
+$sidMissingCount = 0
+$adUsersDataAll | ForEach-Object {
+    if (-not $_.PSObject.Properties['SID']) {
+        $_ | Add-Member -MemberType NoteProperty -Name SID -Value $null -Force
+    }
+}
+function Select-DomainController {
+    param(
+        [string]$PreferredDC,
+        [int]$MaxRetries,
+        [int]$RetryDelaySeconds
+    )
+    $dcCandidates = @()
+    
+    if (-not [string]::IsNullOrWhiteSpace($PreferredDC)) {
+        Write-Verbose "Attempting to validate preferred Domain Controller: $PreferredDC"
+        for ($retry = 1; $retry -le $MaxRetries; $retry++) {
+            try {
+                $dcInfo = Get-ADDomainController -Identity $PreferredDC -ErrorAction Stop
+                Write-Log "Validated Domain Controller: $PreferredDC" -Level INFO
+                return $dcInfo.Name
+            } catch {
+                Write-Log "Attempt $retry/$MaxRetries Failed to connect to Domain Controller '$PreferredDC': $($_.Exception.Message)" -Level WARN
+                if ($retry -lt $MaxRetries) {
+                    Start-Sleep -Seconds $RetryDelaySeconds
+                }
+            }
+        }
+    }
+    
+    Write-Log "Preferred Domain Controller unavailable. Attempting to discover an available Domain Controller..." -Level INFO
+    for ($retry = 1; $retry -le $MaxRetries; $retry++) {
+        try {
+            $dcInfo = Get-ADDomainController -Discover -ForceDiscover -ErrorAction Stop
+            if ($dcInfo) {
+                Write-Log "Discovered Domain Controller: $($dcInfo.Name)" -Level INFO
+                return $dcInfo.Name
+            }
+        } catch {
+            Write-Log "Attempt $retry/$MaxRetries Failed to discover Domain Controller: $($_.Exception.Message)" -Level WARN
+            if ($retry -lt $MaxRetries) {
+                Start-Sleep -Seconds $RetryDelaySeconds
+            }
+        }
+    }
+    
+    Write-Log "Discovery failed. Attempting to use default Domain Controller for current domain..." -Level WARN
+    try {
+        $domain = Get-ADDomain -ErrorAction Stop
+        $defaultDC = $domain.PDCEmulator
+        $dcInfo = Get-ADDomainController -Identity $defaultDC -ErrorAction Stop
+        Write-Log "Using default Domain Controller: $defaultDC" -Level INFO
+        return $dcInfo.Name
+    } catch {
+        Write-Log "Failed to retrieve default Domain Controller: $($_.Exception.Message)" -Level ERROR
+        return $null
+    }
+}
+$script:SelectedDomainController = Select-DomainController -PreferredDC $DomainController -MaxRetries $maxRetries -RetryDelaySeconds $retryDelaySeconds
+if (-not $script:SelectedDomainController) {
+    Write-Log "No Domain Controller could be reached after $maxRetries attempts. SID queries will be skipped." -Level WARN
+    $script:ADConnectionFailed = $true
+} else {
+    Write-Log "Proceeding with Domain Controller: $script:SelectedDomainController" -Level INFO
+    $script:ADConnectionFailed = $false
 }
 foreach ($userRow in $adUsersDataAll) {
     $userSamAccount = $userRow.SamAccountName
     if (-not $userSamAccount) {
         Write-Log "Skipping user record with missing SamAccountName (UPN: $($userRow.UserPrincipalName))" -Level WARN
-        continue
-    }
-    # Validate SamAccountName format (basic check for length and characters)
-    if ($userSamAccount -notmatch '^[a-zA-Z0-9][a-zA-Z0-9\-_\.]{0,19}$' -or $userSamAccount.Length -gt 20) {
-        Write-Log "Invalid SamAccountName '$userSamAccount' (UPN: $($userRow.UserPrincipalName)). Skipping SID query." -Level WARN
-        if (-not $userRow.PSObject.Properties['SID']) { $userRow | Add-Member -MemberType NoteProperty -Name SID -Value $null }
-        else { $userRow.SID = $null }
+        $userRow.SID = $null
         $userSidCache[$userSamAccount] = $null
+        $sidMissingCount++
         continue
     }
-    $sidValue = $null
-    if ($userRow.PSObject.Properties['SID']) {
-        $sidValue = $userRow.SID
+    if ($userSamAccount.Length -gt 256 -or $userSamAccount -match '[\\/:*?"<>|]') {
+        Write-Log "Invalid SamAccountName '$userSamAccount' (UPN: $($userRow.UserPrincipalName)). Contains illegal characters or exceeds 256 characters. Skipping SID query." -Level WARN
+        $userRow.SID = $null
+        $userSidCache[$userSamAccount] = $null
+        $sidMissingCount++
+        continue
     }
+    $sidValue = $userRow.SID
     if (-not $sidValue -or ($sidValue -is [string] -and $sidValue.Length -lt 5) -or ($sidValue -is [System.Security.Principal.SecurityIdentifier] -and -not $sidValue.Value)) {
+        if ($script:ADConnectionFailed) {
+            Write-Log "Skipping SID query for user '$userSamAccount' (UPN: $($userRow.UserPrincipalName)) due to AD connection failure." -Level WARN
+            $userRow.SID = $null
+            $userSidCache[$userSamAccount] = $null
+            $sidMissingCount++
+            continue
+        }
         try {
             Write-Verbose "Querying missing/invalid SID for user '$userSamAccount'"
-            $userObj = Get-ADUser -Identity $userSamAccount -Properties SID -Server $DomainController -ErrorAction Stop
+            $userObj = Get-ADUser -Identity $userSamAccount -Properties SID -Server $script:SelectedDomainController -ErrorAction Stop
             if (-not $userObj.SID) {
-                throw "SID not returned for user '$userSamAccount'"
+                Write-Log "SID not returned for user '$userSamAccount' (UPN: $($userRow.UserPrincipalName))" -Level WARN
+                $userRow.SID = $null
+                $userSidCache[$userSamAccount] = $null
+                $sidMissingCount++
+                continue
             }
             $userSidValue = $userObj.SID.Value
-            if ($userRow.PSObject.Properties['SID']) { $userRow.SID = $userSidValue }
-            else { $userRow | Add-Member -MemberType NoteProperty -Name SID -Value $userSidValue }
+            if (-not $userSidValue -or $userSidValue -notmatch '^S-1-') {
+                Write-Log "Invalid SID format returned for user '$userSamAccount' (UPN: $($userRow.UserPrincipalName)): '$userSidValue'" -Level WARN
+                $userRow.SID = $null
+                $userSidCache[$userSamAccount] = $null
+                $sidMissingCount++
+                continue
+            }
+            $userRow.SID = $userSidValue
             $userSidCache[$userSamAccount] = $userSidValue
+            $sidRetrievalCount++
             Write-Verbose "Retrieved SID '$userSidValue' for user '$userSamAccount'"
         } catch {
             $errorDetails = $_.Exception.Message
-            if ($_.Exception -is [Microsoft.ActiveDirectory.Management.ADError]) {
-                $errorDetails += "; ErrorCode: $($_.Exception.ErrorCode)"
+            $exceptionType = $_.Exception.GetType().FullName
+            Write-Log "Failed to retrieve SID for user '$userSamAccount' (UPN: $($userRow.UserPrincipalName)): $errorDetails (Exception Type: $exceptionType)" -Level WARN
+            if ($_.Exception.InnerException) {
+                Write-Log "Inner Exception: $($_.Exception.InnerException.Message)" -Level WARN
             }
-            Write-Log "Could not get SID for user '$userSamAccount' (UPN: $($userRow.UserPrincipalName)): $errorDetails" -Level WARN
-            if (-not $userRow.PSObject.Properties['SID']) { $userRow | Add-Member -MemberType NoteProperty -Name SID -Value $null }
-            else { $userRow.SID = $null }
+            $userRow.SID = $null
             $userSidCache[$userSamAccount] = $null
+            $sidMissingCount++
         }
     } else {
         $userSidValue = if ($sidValue -is [System.Security.Principal.SecurityIdentifier]) { $sidValue.Value } else { $sidValue }
-        $userSidCache[$userSamAccount] = $userSidValue
-        $userRow.SID = $userSidValue
+        if ($userSidValue -and $userSidValue -match '^S-1-') {
+            $userRow.SID = $userSidValue
+            $userSidCache[$userSamAccount] = $userSidValue
+            $sidRetrievalCount++
+        } else {
+            Write-Log "Invalid SID format in input data for user '$userSamAccount' (UPN: $($userRow.UserPrincipalName)): '$userSidValue'. Setting to null." -Level WARN
+            $userRow.SID = $null
+            $userSidCache[$userSamAccount] = $null
+            $sidMissingCount++
+        }
     }
 }
-
-
-
+Write-Log "SID Retrieval Summary: Successfully retrieved $sidRetrievalCount SIDs, $sidMissingCount users have missing or invalid SIDs." -Level INFO
+$sidSample = $adUsersDataAll | Where-Object { $_.SID } | Select-Object -First 5 | ForEach-Object { "$($_.SamAccountName): $($_.SID)" }
+Write-Log "Sample of SIDs in adUsersDataAll (up to 5): $($sidSample -join ', ')" -Level INFO
+Write-Log "Completed SID retrieval. Proceeding to next preprocessing steps." -Level INFO
 Write-Log "Preprocessing Shared Mailbox Permissions from CSV..." -Level INFO
 $userToSharedMailboxPermsLookup = @{}
 if ($sharedMbData) {
@@ -1070,370 +1194,306 @@ try {
                     $groupInfo = $secGroupData | Where-Object {$_.DistinguishedName -eq $groupDN}
                     if ($groupInfo) { $groupInfo[0].SamAccountName } else { $null }
                 } | Where-Object { $_ }
-                foreach ($groupSAM in $userADGroupsSAMs) {
-                    if ($userToSharedMailboxPermsLookup.ContainsKey($groupSAM)) {
-                        foreach ($perm in $userToSharedMailboxPermsLookup[$groupSAM]) {
-                            if (-not ($batchUserSharedMbPerms | Where-Object {$_.UserIdentifier -eq $userId -and $_.SharedMailbox_PrimarySmtpAddress -eq $perm.SharedMailbox_PrimarySmtpAddress -and $_.PermissionType -eq $perm.PermissionType})) {
-                                $batchUserSharedMbPerms.Add([PSCustomObject]@{
-                                    UserIdentifier                  = $userId
-                                    SharedMailbox_PrimarySmtpAddress = $perm.SharedMailbox_PrimarySmtpAddress
-                                    PermissionType                 = $perm.PermissionType
-                                    AccessRights                   = $perm.AccessRights
-                                    GrantedViaType                 = "ADGroup"
-                                    GrantedViaIdentifier           = $groupSAM
-                                })
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        $userGpos = $null
-        if ($userSID) {
-            $userGpos = Get-AppliedGPOsForUser -User $user -UserGroupMembershipSids $userGroupSidsAD -GpoPermissionsCache $gpoPermissionsCache -GpoLinkCache $gpoLinkCache
-            if ($userGpos -ne $null -and $userGpos.Count -gt 0) {
-                $batchUserAppliedGpos.AddRange($userGpos)
-            }
-        } else {
-            Write-Log "Skipping GPO calculation for $userId because user SID is missing." -Level WARN
-        }
-        if ($logonScriptData) {
-            $adScript = $logonScriptData | Where-Object { $_.Source -eq 'UserObject' -and $_.UserPrincipalName -eq $userUPN }
-            if ($adScript) {
-                $batchUserLogonScripts.Add([PSCustomObject]@{
-                    UserIdentifier = $userId
-                    ScriptPath     = $adScript.ScriptPath
-                    Parameters     = $adScript.ScriptName
-                    SourceType     = $adScript.Source
-                    SourceName     = $adScript.UserPrincipalName
+               }
+
+               foreach ($groupSAM in $userADGroupsSAMs) {
+    if ($userToSharedMailboxPermsLookup.ContainsKey($groupSAM)) {
+        foreach ($perm in $userToSharedMailboxPermsLookup[$groupSAM]) {
+            if (-not ($batchUserSharedMbPerms | Where-Object { $_.UserIdentifier -eq $userId -and $_.SharedMailbox_PrimarySmtpAddress -eq $perm.SharedMailbox_PrimarySmtpAddress -and $_.PermissionType -eq $perm.PermissionType })) {
+                $batchUserSharedMbPerms.Add([PSCustomObject]@{
+                    UserIdentifier                  = $userId
+                    SharedMailbox_PrimarySmtpAddress = $perm.SharedMailbox_PrimarySmtpAddress
+                    PermissionType                 = $perm.PermissionType
+                    AccessRights                   = $perm.AccessRights
+                    GrantedViaType                 = "ADGroup"
+                    GrantedViaIdentifier           = $groupSAM
                 })
             }
-            if ($userGpos) {
-                $appliedGpoIds = $userGpos | Select-Object -ExpandProperty GpoId -Unique
-                $gpoScripts = $logonScriptData | Where-Object { $_.Source -eq 'GPO' -and $_.GPOName -in ($userGpos | Select-Object -ExpandProperty GpoName) }
-                foreach ($scriptItem in $gpoScripts) {
-                    if (-not ($batchUserLogonScripts | Where-Object {$_.UserIdentifier -eq $userId -and $_.ScriptPath -eq $scriptItem.ScriptPath -and $_.SourceName -eq $scriptItem.GPOName})) {
-                        $batchUserLogonScripts.Add([PSCustomObject]@{
-                            UserIdentifier = $userId
-                            ScriptPath     = $scriptItem.ScriptPath
-                            Parameters     = $scriptItem.ScriptName
-                            SourceType     = $scriptItem.Source
-                            SourceName     = $scriptItem.GPOName
-                        })
-                    }
-                }
-            }
-        }
-        if ($driveMapData -and $userGpos) {
-            $appliedGpoIds = $userGpos | Select-Object -ExpandProperty GpoId -Unique
-            $userDriveMaps = $driveMapData | Where-Object { $_.GpoId -in $appliedGpoIds }
-            foreach ($map in $userDriveMaps) {
-                if (-not ($batchUserDriveMaps | Where-Object {$_.UserIdentifier -eq $userId -and $_.DriveLetter -eq $map.DriveLetter -and $_.LocationPath -eq $map.Path})) {
-                    $batchUserDriveMaps.Add([PSCustomObject]@{
-                        UserIdentifier = $userId
-                        DriveLetter    = $map.DriveLetter
-                        LocationPath   = $map.Path
-                        GpoName        = $map.GPOName
-                    })
-                }
-            }
-        }
-        if ($folderRedirData -and $userGpos) {
-            $appliedGpoIds = $userGpos | Select-Object -ExpandProperty GpoId -Unique
-            $userFolderRedir = $folderRedirData | Where-Object { $_.GpoId -in $appliedGpoIds }
-            foreach ($redir in $userFolderRedir) {
-                if (-not ($batchUserFolderRedir | Where-Object {$_.UserIdentifier -eq $userId -and $_.FolderName -eq $redir.FolderName})) {
-                    $batchUserFolderRedir.Add([PSCustomObject]@{
-                        UserIdentifier = $userId
-                        FolderName     = $redir.FolderName
-                        RedirectPath   = $redir.TargetPath
-                        GpoName        = $redir.GPOName
-                    })
-                }
-            }
-        }
-        if ($printerMapData -and $userGpos) {
-            $appliedGpoIds = $userGpos | Select-Object -ExpandProperty GpoId -Unique
-            $userPrinterMaps = $printerMapData | Where-Object { $_.GpoId -in $appliedGpoIds }
-            foreach ($map in $userPrinterMaps) {
-                if (-not ($batchUserPrinterMaps | Where-Object {$_.UserIdentifier -eq $userId -and $_.UNCPath -eq $map.PrinterPath})) {
-                    $batchUserPrinterMaps.Add([PSCustomObject]@{
-                        UserIdentifier = $userId
-                        UNCPath        = $map.PrinterPath
-                        Action         = $map.DefaultPrinter
-                        IsDefault      = $map.DefaultPrinter
-                        GpoName        = $map.GPOName
-                    })
-                }
-            }
-        }
-        if (-not $script:GraphConnectionFailed -and $userGraphId) {
-            $userGraphGroupIds = @()
-            try {
-                $userGraphGroupIds = Get-MgUserTransitiveMemberOf -UserId $userGraphId -All -ErrorAction Stop | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.group' } | Select-Object -ExpandProperty Id -Unique
-            } catch {
-                Write-Log "Error getting Graph group membership for user '$userId' (GraphID: $userGraphId): $($_.Exception.Message)" -Level WARN
-            }
-            if ($intunePolicyData) {
-                foreach ($policy in $intunePolicyData) {
-                    try {
-                        $assignments = Get-MgDeviceManagementDeviceConfigurationAssignment -DeviceConfigurationId $policy.PolicyId -ErrorAction Stop
-                        foreach ($assignment in $assignments) {
-                            $target = $assignment.Target
-                            $assignmentApplies = $false
-                            $assignmentSourceType = "Unknown"
-                            $assignmentSourceId = "Unknown"
-                            $assignmentIntent = $assignment.Intent
-                            if ($target -is [Microsoft.Open.MSGraph.Model.GroupAssignmentTarget]) {
-                                $targetGroupId = $target.GroupId
-                                $assignmentSourceType = "Group"
-                                $assignmentSourceId = $targetGroupId
-                                if ($userGraphGroupIds -contains $targetGroupId) {
-                                    $assignmentApplies = $true
-                                }
-                            } elseif ($target -is [Microsoft.Open.MSGraph.Model.AllUsersAssignmentTarget]) {
-                                $assignmentApplies = $true
-                                $assignmentSourceType = "AllUsers"
-                                $assignmentSourceId = "AllUsers"
-                            } elseif ($target -is [Microsoft.Open.MSGraph.Model.AllDevicesAssignmentTarget]) {
-                                continue
-                            }
-                            if ($assignmentApplies) {
-                                $batchUserIntuneAssignments.Add([PSCustomObject]@{
-                                    UserIdentifier       = $userId
-                                    PolicyId             = $policy.PolicyId
-                                    PolicyName           = $policy.DisplayName
-                                    PolicyPlatform       = $policy.PlatformType
-                                    AssignmentIntent     = $assignmentIntent
-                                    AssignmentSourceType = $assignmentSourceType
-                                    AssignmentSourceId   = $assignmentSourceId
-                                })
-                            }
-                        }
-                    } catch {
-                        Write-Log "Error getting assignments for Intune policy '$($policy.DisplayName)' ($($policy.PolicyId)): $($_.Exception.Message)" -Level WARN
-                    }
-                }
-            }
-            if ($entAppData) {
-                try {
-                    $appAssignments = @()
-                    $directAssignments = Get-MgUserAppRoleAssignment -UserId $userGraphId -All -ErrorAction Stop
-                    if ($directAssignments) {$appAssignments += $directAssignments}
-                    if ($userGraphGroupIds) {
-                        foreach ($groupId in $userGraphGroupIds) {
-                            try {
-                                $groupAppAssignments = Get-MgGroupAppRoleAssignment -GroupId $groupId -All -ErrorAction Stop
-                                if ($groupAppAssignments) { $appAssignments += $groupAppAssignments }
-                            } catch {
-                                Write-Log "Error getting app assignments for group $groupId: $($_.Exception.Message)" -Level WARN
-                            }
-                        }
-                    }
-                    $processedAppAssignmentKeys = [System.Collections.Generic.HashSet[string]]::new()
-                    foreach ($assignment in $appAssignments) {
-                        $servicePrincipalId = $assignment.ResourceId
-                        $appRoleId = $assignment.AppRoleId
-                        $principalId = $assignment.PrincipalId
-                        $principalType = $assignment.PrincipalType
-                        $assignmentKey = "$userId-$servicePrincipalId-$appRoleId"
-                        if ($processedAppAssignmentKeys.Contains($assignmentKey)) { continue }
-                        $appRoleName = "Default Access"
-                        $appName = "Unknown App"
-                        $appId = "Unknown AppId"
-                        try {
-                            $servicePrincipal = Get-MgServicePrincipal -ServicePrincipalId $servicePrincipalId -Property AppId, DisplayName, AppRoles -ErrorAction Stop
-                            if ($servicePrincipal) {
-                                $appName = $servicePrincipal.DisplayName
-                                $appId = $servicePrincipal.AppId
-                                if ($appRoleId -ne '00000000-0000-0000-0000-000000000000' -and $servicePrincipal.AppRoles) {
-                                    $appRole = $servicePrincipal.AppRoles | Where-Object { $_.Id -eq $appRoleId } | Select-Object -First 1
-                                    if ($appRole) { $appRoleName = $appRole.DisplayName } else { $appRoleName = "Unknown Role ($appRoleId)" }
-                                }
-                            }
-                        } catch {
-                            Write-Log "Could not get SP details for $servicePrincipalId: $($_.Exception.Message)" -Level WARN
-                        }
-                        $assignmentSourceType = "Unknown"
-                        $assignmentSourceId = $principalId
-                        if ($principalType -eq 'User' -and $principalId -eq $userGraphId) {
-                            $assignmentSourceType = "DirectUser"
-                        } elseif ($principalType -eq 'Group' -and $userGraphGroupIds -contains $principalId) {
-                            $assignmentSourceType = "Group"
-                        }
-                        if ($assignmentSourceType -ne "Unknown") {
-                            $batchUserAppAssignments.Add([PSCustomObject]@{
-                                UserIdentifier       = $userId
-                                AppId                = $appId
-                                AppName              = $appName
-                                AssignedRoleName     = $appRoleName
-                                AssignmentSourceType = $assignmentSourceType
-                                AssignmentSourceId   = $assignmentSourceId
-                            })
-                            $processedAppAssignmentKeys.Add($assignmentKey) | Out-Null
-                        }
-                    }
-                } catch {
-
-Write-Log "Error getting app role assignments for user '$userId' (GraphID: $userGraphId): $($_.Exception.Message)" -Level WARN
-                }
-            }
-            if ($teamsData) {
-                $userTeams = $teamsData | Where-Object { $_.UserPrincipalName -eq $userUPN }
-                foreach ($team in $userTeams) {
-                    if (-not ($batchUserTeamMembership | Where-Object { $_.UserIdentifier -eq $userId -and $_.TeamId -eq $team.TeamId })) {
-                        $batchUserTeamMembership.Add([PSCustomObject]@{
-                            UserIdentifier     = $userId
-                            TeamId             = $team.TeamId
-                            TeamDisplayName    = $team.TeamDisplayName
-                            MembershipRole     = $team.MembershipRole
-                            Channels           = $team.Channels
-                        })
-                    }
-                }
-            }
-            if ($licensingData) {
-                $userLicenses = $licensingData | Where-Object { $_.UserPrincipalName -eq $userUPN }
-                foreach ($license in $userLicenses) {
-                    if ($license.AssignedLicenses) {
-                        $licenseDetails = $license.AssignedLicenses -split '\|' | Where-Object { $_ }
-                        foreach ($detail in $licenseDetails) {
-                            $parts = $detail -split '\|', 2
-                            $skuId = $parts[0]
-                            $servicePlans = if ($parts.Count -gt 1) { $parts[1] } else { $null }
-                            if (-not ($batchUserLicenseAssignments | Where-Object { $_.UserIdentifier -eq $userId -and $_.LicenseSkuId -eq $skuId })) {
-                                $batchUserLicenseAssignments.Add([PSCustomObject]@{
-                                    UserIdentifier    = $userId
-                                    LicenseSkuId      = $skuId
-                                    ServicePlans      = $servicePlans
-                                })
-                            }
-                        }
-                    }
-                }
-            }
-            if ($deviceInventoryData) {
-                $userDevices = $deviceInventoryData | Where-Object { $_.UserPrincipalName -eq $userUPN }
-                foreach ($device in $userDevices) {
-                    if (-not ($batchUserDevices | Where-Object { $_.UserIdentifier -eq $userId -and $_.DeviceId -eq $device.DeviceId })) {
-                        $batchUserDevices.Add([PSCustomObject]@{
-                            UserIdentifier    = $userId
-                            DeviceId          = $device.DeviceId
-                            DeviceName        = $device.DeviceName
-                            Manufacturer      = $device.Manufacturer
-                            Model             = $device.Model
-                            OperatingSystem   = $device.OperatingSystem
-                            ComplianceState   = $device.ComplianceState
-                        })
-                    }
-                }
-            }
-            if ($caPolicyData -and $caAssignmentLookup -and $userGraphId) {
-                if ($caAssignmentLookup.ContainsKey($userGraphId)) {
-                    foreach ($assignment in $caAssignmentLookup[$userGraphId]) {
-                        $policy = $caPolicyHash[$assignment.PolicyId][0]
-                        if (-not ($batchUserCAPolicyAssignments | Where-Object { $_.UserIdentifier -eq $userId -and $_.PolicyId -eq $policy.Id })) {
-                            $batchUserCAPolicyAssignments.Add([PSCustomObject]@{
-                                UserIdentifier    = $userId
-                                PolicyId          = $policy.Id
-                                PolicyName        = $policy.DisplayName
-                                AssignmentType    = $assignment.AssignmentType
-                            })
-                        }
-                    }
-                }
-                foreach ($groupId in $userGraphGroupIds) {
-                    if ($caAssignmentLookup.ContainsKey($groupId)) {
-                        foreach ($assignment in $caAssignmentLookup[$groupId]) {
-                            $policy = $caPolicyHash[$assignment.PolicyId][0]
-                            if (-not ($batchUserCAPolicyAssignments | Where-Object { $_.UserIdentifier -eq $userId -and $_.PolicyId -eq $policy.Id })) {
-                                $batchUserCAPolicyAssignments.Add([PSCustomObject]@{
-                                    UserIdentifier    = $userId
-                                    PolicyId          = $policy.Id
-                                    PolicyName        = $policy.DisplayName
-                                    AssignmentType    = "Group ($groupId)"
-                                })
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        $lastUserProcessedInBatch = $userId
-        if ($currentBatchUserCount -ge $BatchSize -or $processedUserCountTotal -ge $totalUserCount) {
-            Write-Log "Batch complete. Users processed in batch: $currentBatchUserCount. Total processed: $processedUserCountTotal of $totalUserCount." -Level INFO
-            $batchData = @{
-                'UsersCore'               = $batchUsersCore
-                'UserSecurityGroupMembership' = $batchUserSecGroupMembership
-                'UserDistributionListMembership' = $batchUserDlMembership
-                'UserSharedMailboxPermissions' = $batchUserSharedMbPerms
-                'UserAppliedGPOs'         = $batchUserAppliedGpos
-                'UserIntunePolicyAssignments' = $batchUserIntuneAssignments
-                'UserAppAssignments'      = $batchUserAppAssignments
-                'UserLogonScripts'        = $batchUserLogonScripts
-                'UserDriveMappings'       = $batchUserDriveMaps
-                'UserFolderRedirection'   = $batchUserFolderRedir
-                'UserPrinterMappings'     = $batchUserPrinterMaps
-                'UserTeamMemberships'     = $batchUserTeamMembership
-                'UserLicenseAssignments'  = $batchUserLicenseAssignments
-                'UserDevices'             = $batchUserDevices
-                'UserConditionalAccessPolicyAssignments' = $batchUserCAPolicyAssignments
-            }
-            Append-BatchToCsvs -BatchData $batchData
-            if ($lastUserProcessedInBatch) {
-                try {
-                    Set-Content -Path $script:StateFilePath -Value $lastUserProcessedInBatch -Encoding UTF8 -ErrorAction Stop
-                    Write-Log "Updated state file with last processed user: $lastUserProcessedInBatch" -Level INFO
-                } catch {
-                    Write-Log "Error updating state file '$($script:StateFilePath)': $($_.Exception.Message)" -Level ERROR
-                }
-            }
-            $batchUsersCore.Clear()
-            $batchUserSecGroupMembership.Clear()
-            $batchUserDlMembership.Clear()
-            $batchUserSharedMbPerms.Clear()
-            $batchUserAppliedGpos.Clear()
-            $batchUserIntuneAssignments.Clear()
-            $batchUserAppAssignments.Clear()
-            $batchUserLogonScripts.Clear()
-            $batchUserDriveMaps.Clear()
-            $batchUserFolderRedir.Clear()
-            $batchUserPrinterMaps.Clear()
-            $batchUserTeamMembership.Clear()
-            $batchUserLicenseAssignments.Clear()
-            $batchUserDevices.Clear()
-            $batchUserCAPolicyAssignments.Clear()
-            $currentBatchUserCount = 0
-            $lastUserProcessedInBatch = $null
         }
     }
-    Write-Progress -Activity "Aggregating User Data" -Completed
-    if ($processedUserCountTotal -eq $totalUserCount) {
-        try {
-            if (Test-Path $script:StateFilePath -PathType Leaf) {
-                Remove-Item $script:StateFilePath -Force -ErrorAction Stop
-                Write-Log "Removed state file as all users were processed." -Level INFO
-            }
-        } catch {
-            Write-Log "Error removing state file '$($script:StateFilePath)': $($_.Exception.Message)" -Level WARN
-        }
-    }
-    Write-Log "Aggregation complete. Total users processed: $processedUserCountTotal of $totalUserCount." -Level INFO
-    if ($script:GraphConnectionFailed) {
-        Write-Log "Some data was skipped due to Graph connection issues. Check logs for details." -Level WARN
-    }
-} finally {
-    Write-Log "Cleaning up connections..." -Level INFO
-    if (-not $script:GraphConnectionFailed -and (Get-MgContext)) {
-        try {
-            Disconnect-MgGraph -ErrorAction Stop
-            Write-Log "Disconnected from Microsoft Graph." -Level INFO
-        } catch {
-            Write-Log "Error disconnecting from Graph: $($_.Exception.Message)" -Level WARN
-        }
-    }
-    Write-Log "Aggregation script finished." -Level INFO
-    Write-Log "Output files are located in: $OutputCsvPath" -Level INFO
-    Write-Log "Log file: $script:LogPath" -Level INFO
 }
+
+}
+# Process GPOs
+$appliedGPOs = Get-AppliedGPOsForUser -User $user -UserGroupMembershipSids $userGroupSidsAD -GpoPermissionsCache $gpoPermissionsCache -GpoLinkCache $gpoLinkCache
+if ($appliedGPOs -and $appliedGPOs.Count -gt 0) {
+    $batchUserAppliedGpos.AddRange([PSCustomObject[]]$appliedGPOs)
+}
+
+# Process Intune Policy Assignments
+if (-not $script:GraphConnectionFailed -and $intunePolicyData -and $userGraphId) {
+    foreach ($policy in $intunePolicyData) {
+        if ($policy.Assignments) {
+            $assignments = $policy.Assignments -split ';' | Where-Object { $_ }
+            foreach ($assignment in $assignments) {
+                $groupId = ($assignment -split ':')[0]
+                if ($groupId -and ($assignment -like '*Include*')) {
+                    $members = Get-GraphTransitiveGroupMembers -GroupId $groupId
+                    if ($members -contains $userUPN) {
+                        $batchUserIntuneAssignments.Add([PSCustomObject]@{
+                            UserIdentifier = $userId
+                            PolicyId       = $policy.PolicyId
+                            PolicyName     = $policy.DisplayName
+                            AssignmentType = "Group"
+                            AssignedVia    = $groupId
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Process Enterprise Application Assignments
+if (-not $script:GraphConnectionFailed -and $entAppData -and $userGraphId) {
+    foreach ($app in $entAppData) {
+        if ($app.Assignments) {
+            $assignments = $app.Assignments -split ';' | Where-Object { $_ }
+            foreach ($assignment in $assignments) {
+                $parts = $assignment -split ':'
+                $targetId = $parts[0]
+                $assignmentType = $parts[1]
+                if ($assignmentType -like '*Include*') {
+                    if ($assignmentType -eq 'UserInclude' -and $targetId -eq $userGraphId) {
+                        $batchUserAppAssignments.Add([PSCustomObject]@{
+                            UserIdentifier = $userId
+                            AppId          = $app.AppId
+                            AppName        = $app.DisplayName
+                            AssignmentType = "DirectUser"
+                            AssignedVia    = $userGraphId
+                        })
+                    } elseif ($assignmentType -eq 'GroupInclude') {
+                        $members = Get-GraphTransitiveGroupMembers -GroupId $targetId
+                        if ($members -contains $userUPN) {
+                            $batchUserAppAssignments.Add([PSCustomObject]@{
+                                UserIdentifier = $userId
+                                AppId          = $app.AppId
+                                AppName        = $app.DisplayName
+                                AssignmentType = "Group"
+                                AssignedVia    = $targetId
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Process Logon Scripts, Drive Mappings, Folder Redirection, Printer Mappings
+if ($logonScriptData -and $appliedGPOs) {
+    $userGpoIds = $appliedGPOs | Select-Object -ExpandProperty GpoId -Unique
+    foreach ($script in $logonScriptData) {
+        if ($userGpoIds -contains $script.GpoId) {
+            $batchUserLogonScripts.Add([PSCustomObject]@{
+                UserIdentifier = $userId
+                GpoId          = $script.GpoId
+                ScriptPath     = $script.ScriptPath
+                ScriptType     = $script.ScriptType
+            })
+        }
+    }
+}
+
+if ($driveMapData -and $appliedGPOs) {
+    $userGpoIds = $appliedGPOs | Select-Object -ExpandProperty GpoId -Unique
+    foreach ($drive in $driveMapData) {
+        if ($userGpoIds -contains $drive.GpoId) {
+            $batchUserDriveMaps.Add([PSCustomObject]@{
+                UserIdentifier = $userId
+                GpoId          = $drive.GpoId
+                DriveLetter    = $drive.DriveLetter
+                UncPath        = $drive.UncPath
+            })
+        }
+    }
+}
+
+if ($folderRedirData -and $appliedGPOs) {
+    $userGpoIds = $appliedGPOs | Select-Object -ExpandProperty GpoId -Unique
+    foreach ($redir in $folderRedirData) {
+        if ($userGpoIds -contains $redir.GpoId) {
+            $batchUserFolderRedir.Add([PSCustomObject]@{
+                UserIdentifier = $userId
+                GpoId          = $redir.GpoId
+                FolderName     = $redir.FolderName
+                RedirectedPath = $redir.RedirectedPath
+            })
+        }
+    }
+}
+
+if ($printerMapData -and $appliedGPOs) {
+    $userGpoIds = $appliedGPOs | Select-Object -ExpandProperty GpoId -Unique
+    foreach ($printer in $printerMapData) {
+        if ($userGpoIds -contains $printer.GpoId) {
+            $batchUserPrinterMaps.Add([PSCustomObject]@{
+                UserIdentifier = $userId
+                GpoId          = $printer.GpoId
+                PrinterName    = $printer.PrinterName
+                PrinterPath    = $printer.PrinterPath
+            })
+        }
+    }
+}
+
+# Process Teams Membership
+if ($teamsData -and $userUPN) {
+    $userTeams = $teamsData | Where-Object { $_.MemberUPN -eq $userUPN }
+    foreach ($team in $userTeams) {
+        $batchUserTeamMembership.Add([PSCustomObject]@{
+            UserIdentifier = $userId
+            TeamId         = $team.TeamId
+            TeamName       = $team.TeamName
+            Role           = $team.Role
+        })
+    }
+}
+
+# Process License Assignments
+if ($licensingData -and $userUPN) {
+    $userLicenses = $licensingData | Where-Object { $_.UserPrincipalName -eq $userUPN }
+    foreach ($license in $userLicenses) {
+        $batchUserLicenseAssignments.Add([PSCustomObject]@{
+            UserIdentifier = $userId
+            SkuId          = $license.SkuId
+            SkuPartNumber  = $license.SkuPartNumber
+            ServicePlans   = $license.ServicePlans
+        })
+    }
+}
+
+# Process Device Inventory
+if ($deviceInventoryData -and $userUPN) {
+    $userDevices = $deviceInventoryData | Where-Object { $_.RegisteredOwnerUPN -eq $userUPN }
+    foreach ($device in $userDevices) {
+        $batchUserDevices.Add([PSCustomObject]@{
+            UserIdentifier = $userId
+            DeviceId       = $device.DeviceId
+            DeviceName     = $device.DeviceName
+            DeviceType     = $device.DeviceType
+            LastSeen       = $device.LastSeen
+        })
+    }
+}
+
+# Process Conditional Access Policy Assignments
+if (-not $script:GraphConnectionFailed -and $caAssignmentData -and $userGraphId) {
+    if ($caAssignmentLookup.ContainsKey($userGraphId)) {
+        foreach ($assignment in $caAssignmentLookup[$userGraphId]) {
+            $policyId = $assignment.PolicyId
+            if ($caPolicyHash.ContainsKey($policyId)) {
+                $policy = $caPolicyHash[$policyId][0]
+                $batchUserCAPolicyAssignments.Add([PSCustomObject]@{
+                    UserIdentifier = $userId
+                    PolicyId       = $policyId
+                    PolicyName     = $policy.DisplayName
+                    AssignmentType = "DirectUser"
+                    AssignedVia    = $userGraphId
+                })
+            }
+        }
+    }
+    if ($userGroupMembershipsAD.ContainsKey($userSam)) {
+        $userADGroups = $userGroupMembershipsAD[$userSam] | ForEach-Object {
+            $groupDN = $_
+            $groupInfo = $secGroupData | Where-Object { $_.DistinguishedName -eq $groupDN }
+            if ($groupInfo) { $groupInfo[0] } else { $null }
+        } | Where-Object { $_ }
+        foreach ($group in $userADGroups) {
+            if ($group.ObjectGuid -and $caAssignmentLookup.ContainsKey($group.ObjectGuid)) {
+                foreach ($assignment in $caAssignmentLookup[$group.ObjectGuid]) {
+                    $policyId = $assignment.PolicyId
+                    if ($caPolicyHash.ContainsKey($policyId)) {
+                        $policy = $caPolicyHash[$policyId][0]
+                        $batchUserCAPolicyAssignments.Add([PSCustomObject]@{
+                            UserIdentifier = $userId
+                            PolicyId       = $policyId
+                            PolicyName     = $policy.DisplayName
+                            AssignmentType = "Group"
+                            AssignedVia    = $group.ObjectGuid
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+$lastUserProcessedInBatch = $userId
+if ($currentBatchUserCount -ge $BatchSize -or $processedUserCountTotal -eq $totalUserCount) {
+    Write-Log "Writing batch of $currentBatchUserCount users to CSV files..." -Level INFO
+    $batchData = @{
+        "UsersCore"                   = $batchUsersCore
+        "UserSecurityGroupMembership" = $batchUserSecGroupMembership
+        "UserDlMembership"            = $batchUserDlMembership
+        "UserSharedMailboxPermissions"= $batchUserSharedMbPerms
+        "UserAppliedGPOs"             = $batchUserAppliedGpos
+        "UserIntuneAssignments"       = $batchUserIntuneAssignments
+        "UserAppAssignments"          = $batchUserAppAssignments
+        "UserLogonScripts"            = $batchUserLogonScripts
+        "UserDriveMappings"           = $batchUserDriveMaps
+        "UserFolderRedirection"       = $batchUserFolderRedir
+        "UserPrinterMappings"         = $batchUserPrinterMaps
+        "UserTeamMembership"          = $batchUserTeamMembership
+        "UserLicenseAssignments"      = $batchUserLicenseAssignments
+        "UserDevices"                 = $batchUserDevices
+        "UserCAPolicyAssignments"     = $batchUserCAPolicyAssignments
+    }
+    Append-BatchToCsvs -BatchData $batchData
+    Write-Log "Saving state to $($script:StateFilePath) with last processed user: $lastUserProcessedInBatch" -Level INFO
+    try {
+        Set-Content -Path $script:StateFilePath -Value $lastUserProcessedInBatch -ErrorAction Stop
+    } catch {
+        Write-Log "Error saving state to '$($script:StateFilePath)': $($_.Exception.Message)" -Level ERROR
+    }
+    $batchUsersCore.Clear()
+    $batchUserSecGroupMembership.Clear()
+    $batchUserDlMembership.Clear()
+    $batchUserSharedMbPerms.Clear()
+    $batchUserAppliedGpos.Clear()
+    $batchUserIntuneAssignments.Clear()
+    $batchUserAppAssignments.Clear()
+    $batchUserLogonScripts.Clear()
+    $batchUserDriveMaps.Clear()
+    $batchUserFolderRedir.Clear()
+    $batchUserPrinterMaps.Clear()
+    $batchUserTeamMembership.Clear()
+    $batchUserLicenseAssignments.Clear()
+    $batchUserDevices.Clear()
+    $batchUserCAPolicyAssignments.Clear()
+    $currentBatchUserCount = 0
+    Write-Log "Batch processing completed. Cleared batch lists." -Level INFO
+}
+}
+
+Write-Progress -Activity "Aggregating User Data" -Completed
+Write-Log "Aggregation script completed all phases." -Level INFO
+Write-Log "Total users processed: $processedUserCountTotal of $totalUserCount." -Level INFO
+if ($script:GraphConnectionFailed) {
+    Write-Log "Some data was skipped due to Graph connection issues." -Level WARN
+}
+if ($batchUserAppliedGpos.Count -gt 0) {
+    Write-Log "Final GPO assignments recorded: $($batchUserAppliedGpos.Count)" -Level INFO
+}
+$userAppliedGposCsvPath = Join-Path $OutputCsvPath "UserAppliedGPOs.csv"
+if (Test-Path $userAppliedGposCsvPath -PathType Leaf) {
+    Write-Log "UserAppliedGPOs.csv was generated at: $userAppliedGposCsvPath" -Level INFO
+} else {
+    Write-Log "UserAppliedGPOs.csv was not generated. Check if GPO data exists or if processing was interrupted." -Level WARN
+}
+Write-Log "Script execution finished." -Level INFO
+
+} finally {
+    Write-Log "Executing cleanup in finally block..."
+    try {
+        Disconnect-MgGraph -ErrorAction SilentlyContinue
+        Write-Log "Disconnected from Microsoft Graph." -Level INFO
+    } catch {
+        Write-Log "Error disconnecting from Graph: $($_.Exception.Message)" -Level WARN
+    }
+}
+
+
+
 #endregion Main Aggregation Logic
